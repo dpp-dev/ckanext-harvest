@@ -6,6 +6,7 @@ import socket
 
 from sqlalchemy import exists
 
+from ckan.lib.base import c
 from ckan import model
 from ckan.logic import ValidationError, NotFound, get_action
 from ckan.lib.helpers import json
@@ -67,7 +68,9 @@ class CKANHarvester(HarvesterBase):
             data = json.loads(content)
             if self.action_api_version == 3:
                 return data.pop('result')
+            
             return data
+            
         except (ContentFetchError, ValueError):
             log.debug('Could not fetch/decode remote group')
             raise RemoteResourceError('Could not fetch/decode remote group')
@@ -118,47 +121,27 @@ class CKANHarvester(HarvesterBase):
             if 'default_tags' in config_obj:
                 if not isinstance(config_obj['default_tags'], list):
                     raise ValueError('default_tags must be a list')
-                if config_obj['default_tags'] and \
-                        not isinstance(config_obj['default_tags'][0], dict):
-                    raise ValueError('default_tags must be a list of '
-                                     'dictionaries')
 
             if 'default_groups' in config_obj:
                 if not isinstance(config_obj['default_groups'], list):
-                    raise ValueError('default_groups must be a *list* of group'
-                                     ' names/ids')
-                if config_obj['default_groups'] and \
-                        not isinstance(config_obj['default_groups'][0],
-                                       basestring):
-                    raise ValueError('default_groups must be a list of group '
-                                     'names/ids (i.e. strings)')
+                    raise ValueError('default_groups must be a list')
 
                 # Check if default groups exist
-                context = {'model': model, 'user': toolkit.c.user}
-                config_obj['default_group_dicts'] = []
-                for group_name_or_id in config_obj['default_groups']:
+                context = {'model': model, 'user': c.user}
+                for group_name in config_obj['default_groups']:
                     try:
                         group = get_action('group_show')(
-                            context, {'id': group_name_or_id})
-                        # save the dict to the config object, as we'll need it
-                        # in the import_stage of every dataset
-                        config_obj['default_group_dicts'].append(group)
+                            context, {'id': group_name})
                     except NotFound, e:
                         raise ValueError('Default group not found')
-                config = json.dumps(config_obj)
 
             if 'default_extras' in config_obj:
                 if not isinstance(config_obj['default_extras'], dict):
                     raise ValueError('default_extras must be a dictionary')
 
-            if 'organizations_filter_include' in config_obj \
-                and 'organizations_filter_exclude' in config_obj:
-                raise ValueError('Harvest configuration cannot contain both '
-                    'organizations_filter_include and organizations_filter_exclude')
-
             if 'user' in config_obj:
                 # Check if user exists
-                context = {'model': model, 'user': toolkit.c.user}
+                context = {'model': model, 'user': c.user}
                 try:
                     user = get_action('user_show')(
                         context, {'id': config_obj.get('user')})
@@ -231,7 +214,7 @@ class CKANHarvester(HarvesterBase):
                 log.info('No datasets have been updated on the remote '
                          'CKAN instance since the last harvest job %s',
                          last_time)
-                return []
+                return None
 
         # Fall-back option - request all the datasets from the remote CKAN
         if get_all_packages:
@@ -250,7 +233,7 @@ class CKANHarvester(HarvesterBase):
             self._save_gather_error(
                 'No datasets found at CKAN: %s' % remote_ckan_base_url,
                 harvest_job)
-            return []
+            return None
 
         # Create harvest objects for each dataset
         try:
@@ -428,20 +411,8 @@ class CKANHarvester(HarvesterBase):
 
                 for group_ in package_dict['groups']:
                     try:
-                        try:
-                            if 'id' in group_:
-                                data_dict = {'id': group_['id']}
-                                group = get_action('group_show')(base_context.copy(), data_dict)
-                            else:
-                                raise NotFound
-
-                        except NotFound, e:
-                            if 'name' in group_:
-                                data_dict = {'id': group_['name']}
-                                group = get_action('group_show')(base_context.copy(), data_dict)
-                            else:
-                                raise NotFound
-                        # Found local group
+                        data_dict = {'id': group_['name']}
+                        group = get_action('group_show')(base_context.copy(), data_dict)
                         validated_groups.append({'id': group['id'], 'name': group['name']})
 
                     except NotFound, e:
@@ -510,10 +481,9 @@ class CKANHarvester(HarvesterBase):
             if default_groups:
                 if not 'groups' in package_dict:
                     package_dict['groups'] = []
-                existing_group_ids = [g['id'] for g in package_dict['groups']]
                 package_dict['groups'].extend(
-                    [g for g in self.config['default_group_dicts']
-                     if g['id'] not in existing_group_ids])
+                    [g for g in default_groups
+                     if g not in package_dict['groups']])
 
             # Set default extras if needed
             default_extras = self.config.get('default_extras', {})
@@ -544,7 +514,11 @@ class CKANHarvester(HarvesterBase):
                             dataset_id=package_dict['id'])
 
                     package_dict['extras'].append({'key': key, 'value': value})
-
+            # Set default frequency if needed
+            default_frequency = self.config.get('default_frequency', None)
+            log.info('default frequency %s', default_frequency)
+            if default_frequency:
+                package_dict['frequency'] = default_frequency
             for resource in package_dict.get('resources', []):
                 # Clear remote url_type for resources (eg datastore, upload) as
                 # we are only creating normal resources with links to the
